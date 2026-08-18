@@ -26,6 +26,24 @@ public sealed class OpenApiValidationOptions
     /// </summary>
     public long MaxResponseBufferSizeBytes { get; set; } = 10 * 1024 * 1024;
 
+    /// <summary>
+    /// The maximum number of bytes buffered while reading a request body for validation.
+    /// Defaults to 10 MiB.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A request body larger than the cap is never parsed or validated (distinct from a parse
+    /// or schema failure). Under <see cref="ViolationHandling.Throw"/> a catchable
+    /// <see cref="OpenApiContractValidationException"/> is raised before the rest of the
+    /// pipeline runs, so the request body is not validated and no downstream handler reads it.
+    /// Under <see cref="ViolationHandling.Log"/> the violation is logged and the body is
+    /// skipped for validation while the request proceeds normally: the read position is
+    /// rewound to zero after the bounded read, so downstream handlers still see the buffered
+    /// body from the start and any remainder streams through on demand.
+    /// </para>
+    /// </remarks>
+    public long MaxRequestBufferSizeBytes { get; set; } = 10 * 1024 * 1024;
+
     /// <summary>Which directions (request and/or response) are validated.</summary>
     public ValidationDirection Validate { get; set; } = ValidationDirection.Both;
 
