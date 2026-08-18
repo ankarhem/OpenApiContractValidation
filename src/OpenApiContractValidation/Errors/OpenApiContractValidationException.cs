@@ -19,7 +19,20 @@ public sealed class OpenApiContractValidationException : Exception
         string? path,
         IReadOnlyList<ContractViolation> violations
     )
-        : base(BuildMessage(phase, httpMethod, path, violations))
+        : this(phase, httpMethod, path, violations, innerException: null) { }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="OpenApiContractValidationException"/> class
+    /// with an inner exception.
+    /// </summary>
+    public OpenApiContractValidationException(
+        ContractPhase phase,
+        string? httpMethod,
+        string? path,
+        IReadOnlyList<ContractViolation> violations,
+        Exception? innerException
+    )
+        : base(BuildMessage(phase, httpMethod, path, violations), innerException)
     {
         Phase = phase;
         HttpMethod = httpMethod;

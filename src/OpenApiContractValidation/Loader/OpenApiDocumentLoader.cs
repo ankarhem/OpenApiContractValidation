@@ -45,7 +45,37 @@ public sealed class OpenApiDocumentLoader
     /// </exception>
     public OpenApiDocument LoadFromFile(string path)
     {
-        var text = File.ReadAllText(path);
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex)
+            when (ex is FileNotFoundException
+                || ex is DirectoryNotFoundException
+                || ex is UnauthorizedAccessException
+                || ex.GetType() == typeof(IOException)
+            )
+        {
+            throw new OpenApiContractValidationException(
+                ContractPhase.Startup,
+                httpMethod: null,
+                path,
+                new List<ContractViolation>
+                {
+                    new ContractViolation(
+                        Location: "contractFile",
+                        InstanceLocation: null,
+                        Keyword: null,
+                        Expected: null,
+                        Actual: null,
+                        Message: "the contract file could not be read."
+                    ),
+                },
+                ex
+            );
+        }
+
         return LoadFromText(text, InferFormatFromExtension(path));
     }
 
@@ -63,7 +93,9 @@ public sealed class OpenApiDocumentLoader
     /// </exception>
     public OpenApiDocument LoadFromStream(Stream stream, string? format = null)
     {
-        using var reader = new StreamReader(stream);
+        // leaveOpen: the stream is owned by the caller (options.ContractStream); the loader
+        // must not dispose it.
+        using var reader = new StreamReader(stream, leaveOpen: true);
         var text = reader.ReadToEnd();
         return LoadFromText(text, format);
     }
@@ -120,7 +152,7 @@ public sealed class OpenApiDocumentLoader
                         Keyword: null,
                         Expected: null,
                         Actual: null,
-                        Message: "The OpenAPI document could not be parsed."
+                        Message: "the OpenAPI document could not be parsed."
                     )
                 );
             }
@@ -139,7 +171,7 @@ public sealed class OpenApiDocumentLoader
                     Keyword: "required",
                     Expected: "info with a non-empty version",
                     Actual: null,
-                    Message: "The OpenAPI document is missing the required 'info' section or version."
+                    Message: "the OpenAPI document is missing the required 'info' section or version."
                 )
             );
         }

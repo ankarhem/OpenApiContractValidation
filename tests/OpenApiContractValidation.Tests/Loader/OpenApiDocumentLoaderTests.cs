@@ -248,4 +248,18 @@ public class OpenApiDocumentLoaderTests
         Assert.NotNull(doc.Paths);
         Assert.True(doc.Paths!.ContainsKey("/pets"));
     }
+
+    [Fact]
+    public void LoadFromFile_MissingFile_ThrowsContractValidationExceptionWithStartupPhase()
+    {
+        var missingPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
+
+        var ex = Assert.Throws<OpenApiContractValidationException>(() =>
+            _loader.LoadFromFile(missingPath)
+        );
+
+        Assert.Equal(ContractPhase.Startup, ex.Phase);
+        Assert.Contains(missingPath, ex.Message);
+        Assert.IsType<FileNotFoundException>(ex.InnerException);
+    }
 }
