@@ -233,7 +233,14 @@ public sealed class HoldBackResponseBodyFeature : IHttpResponseBodyFeature, IAsy
     /// pending inside the <see cref="Writer"/> are flushed into the buffer first.
     /// </summary>
     /// <returns>A copy of the buffered response body.</returns>
-    public byte[] GetBufferedBytes()
+    public byte[] GetBufferedBytes() => GetBufferedSpan().ToArray();
+
+    /// <summary>
+    /// Returns the bytes captured so far as a span over the internal buffer, without copying,
+    /// for the middleware's validation path. Any bytes still pending inside the
+    /// <see cref="Writer"/> are flushed into the buffer first.
+    /// </summary>
+    internal ReadOnlySpan<byte> GetBufferedSpan()
     {
         if (_writer is not null)
         {
@@ -242,7 +249,7 @@ public sealed class HoldBackResponseBodyFeature : IHttpResponseBodyFeature, IAsy
             _writer.FlushAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
         }
 
-        return _buffer.ToArray();
+        return _buffer.GetBuffer().AsSpan(0, (int)_buffer.Length);
     }
 
     /// <summary>

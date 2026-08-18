@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
@@ -61,9 +62,12 @@ public sealed class OpenApiValidationMiddleware
         ILogger<OpenApiValidationMiddleware> logger
     )
     {
-        _next = next ?? throw new ArgumentNullException(nameof(next));
-        _validator = validator ?? throw new ArgumentNullException(nameof(validator));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(next);
+        ArgumentNullException.ThrowIfNull(validator);
+        ArgumentNullException.ThrowIfNull(logger);
+        _next = next;
+        _validator = validator;
+        _logger = logger;
     }
 
     /// <summary>
@@ -152,17 +156,58 @@ public sealed class OpenApiValidationMiddleware
 
         if ((direction & ValidationDirection.Request) != 0)
         {
-            var parsedRequest = await BuildParsedRequestAsync(context, method, path)
+            var parsedRequest = await BuildParsedRequestAsync(
+                    context,
+                    method,
+                    path,
+                    options.MaxRequestBufferSizeBytes,
+                    context.RequestAborted
+                )
                 .ConfigureAwait(false);
-            var requestResult = _validator.ValidateRequest(
-                operation,
-                parsedRequest,
-                pathParameters
-            );
-            if (!requestResult.IsValid)
+
+            if (parsedRequest is null)
             {
-                // Throw policy: throws. Log policy: logs and falls through to run the request anyway.
-                HandleViolation(ContractPhase.Request, method, path, requestResult.Violations);
+                // The body exceeded the buffer cap, so it was never parsed: this is distinct from
+                // a parse or schema failure, and the body is not validated at all. Throw policy:
+                // throws here, before _next, so no downstream handler reads the body. Log policy:
+                // HandleViolation logs and the pipeline continues, with the rewound stream still
+                // readable downstream (mirroring the response-cap pass-through semantics).
+                var limit =
+                    options.MaxRequestBufferSizeBytes.ToString(CultureInfo.InvariantCulture)
+                    + " bytes";
+                var totalBytes = Math.Max(
+                    context.Request.ContentLength ?? 0,
+                    options.MaxRequestBufferSizeBytes + 1
+                );
+                HandleViolation(
+                    ContractPhase.Request,
+                    method,
+                    path,
+                    new[]
+                    {
+                        new ContractViolation(
+                            Location: "requestBody",
+                            InstanceLocation: null,
+                            Keyword: null,
+                            Expected: limit,
+                            Actual: totalBytes.ToString(CultureInfo.InvariantCulture) + " bytes",
+                            Message: $"the request body exceeds the maximum buffer size ({limit}) and cannot be validated."
+                        ),
+                    }
+                );
+            }
+            else
+            {
+                var requestResult = _validator.ValidateRequest(
+                    operation,
+                    parsedRequest,
+                    pathParameters
+                );
+                if (!requestResult.IsValid)
+                {
+                    // Throw policy: throws. Log policy: logs and falls through to run the request anyway.
+                    HandleViolation(ContractPhase.Request, method, path, requestResult.Violations);
+                }
             }
         }
 
@@ -243,6 +288,23 @@ public sealed class OpenApiValidationMiddleware
         finally
         {
             context.Features.Set(originalFeature);
+
+            // The holdback (buffer + PipeWriter) is always disposed, even on the throw path.
+            // Disposal is idempotent after CommitAsync; a disposal failure is logged rather
+            // than thrown so it can never mask an in-flight contract violation exception.
+            try
+            {
+                await holdback.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Disposing the response hold-back feature for {Method} {Path} failed.",
+                    method,
+                    path
+                );
+            }
         }
     }
 
@@ -261,7 +323,22 @@ public sealed class OpenApiValidationMiddleware
     {
         var exception = new OpenApiContractValidationException(phase, method, path, violations);
 
-        _validator.Options.OnViolation?.Invoke(exception);
+        // An observer exception must never replace the contract violation exception (Throw) or
+        // break the request (Log): it is isolated and logged.
+        try
+        {
+            _validator.Options.OnViolation?.Invoke(exception);
+        }
+        catch (Exception observerException)
+        {
+            _logger.LogWarning(
+                observerException,
+                "The configured OnViolation observer threw an exception for {Phase} {Method} {Path}; violation handling continues.",
+                phase,
+                method,
+                path
+            );
+        }
 
         if (_validator.Options.Handling == ViolationHandling.Throw)
         {
@@ -279,13 +356,18 @@ public sealed class OpenApiValidationMiddleware
 
     /// <summary>
     /// Reads and parses the incoming request body (when present and JSON), building a
-    /// <see cref="ParsedRequest"/> suitable for the framework-agnostic validator. The request stream is
-    /// rewound so downstream handlers see an unread body.
+    /// <see cref="ParsedRequest"/> suitable for the framework-agnostic validator. The body is
+    /// read with a bounded, cancellation-aware read of at most <paramref name="maxBufferSizeBytes"/>
+    /// bytes and the request stream is rewound so downstream handlers see an unread body.
+    /// Returns <see langword="null"/> when the body exceeds the cap: the caller reports the
+    /// violation and skips validation (the body itself is never parsed).
     /// </summary>
-    private static async Task<ParsedRequest> BuildParsedRequestAsync(
+    private static async Task<ParsedRequest?> BuildParsedRequestAsync(
         HttpContext context,
         string method,
-        string path
+        string path,
+        long maxBufferSizeBytes,
+        CancellationToken cancellationToken
     )
     {
         var request = context.Request;
@@ -296,15 +378,22 @@ public sealed class OpenApiValidationMiddleware
         if (MayHaveBody(request))
         {
             request.EnableBuffering();
-            using var reader = new StreamReader(
-                request.Body,
-                Encoding.UTF8,
-                detectEncodingFromByteOrderMarks: false,
-                bufferSize: 1024,
-                leaveOpen: true
-            );
-            rawBody = await reader.ReadToEndAsync().ConfigureAwait(false);
+
+            rawBody = await ReadBodyBoundedAsync(
+                    request.Body,
+                    maxBufferSizeBytes,
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
+
+            // Rewind in every case (under and over cap): under Throw nobody downstream runs, and
+            // under Log downstream handlers must still be able to read the buffered body.
             request.Body.Position = 0;
+
+            if (rawBody is null)
+            {
+                return null;
+            }
 
             if (!string.IsNullOrEmpty(rawBody) && IsJsonContentType(request.ContentType))
             {
@@ -326,6 +415,37 @@ public sealed class OpenApiValidationMiddleware
     }
 
     /// <summary>
+    /// Reads the body up to <paramref name="maxBufferSizeBytes"/> bytes and returns the decoded
+    /// UTF-8 text. Returns <see langword="null"/> when the body exceeds the cap: the read stops
+    /// as soon as one byte beyond the cap is observed, so a huge body is never buffered.
+    /// </summary>
+    private static async Task<string?> ReadBodyBoundedAsync(
+        Stream body,
+        long maxBufferSizeBytes,
+        CancellationToken cancellationToken
+    )
+    {
+        var buffer = new byte[81920];
+        using var buffered = new MemoryStream();
+
+        while (true)
+        {
+            var read = await body.ReadAsync(buffer.AsMemory(), cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                return Encoding.UTF8.GetString(buffered.ToArray());
+            }
+
+            buffered.Write(buffer, 0, read);
+            if (buffered.Length > maxBufferSizeBytes)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
     /// Builds a <see cref="ParsedResponse"/> from the response status, headers and the bytes captured by
     /// the hold-back feature. HEAD responses never carry a body regardless of what was buffered.
     /// </summary>
@@ -337,7 +457,7 @@ public sealed class OpenApiValidationMiddleware
     {
         var response = context.Response;
         var isHead = HttpMethods.IsHead(method);
-        var bufferedBytes = holdback.GetBufferedBytes();
+        var bufferedBytes = holdback.GetBufferedSpan();
         var hasBody = !isHead && bufferedBytes.Length > 0;
 
         string? rawBody = hasBody ? Encoding.UTF8.GetString(bufferedBytes) : null;
@@ -367,8 +487,9 @@ public sealed class OpenApiValidationMiddleware
         && contentType.Contains(JsonToken, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Parses JSON without throwing: a malformed body yields <see langword="null"/> so that downstream
-    /// schema validation flags the content mismatch precisely.
+    /// Parses JSON without throwing: a malformed body yields <see langword="null"/>, which the
+    /// validators interpret — together with a matched JSON media type and a non-empty raw body —
+    /// as a "body is not valid JSON" contract violation.
     /// </summary>
     private static JsonElement? TryParseJson(string text)
     {

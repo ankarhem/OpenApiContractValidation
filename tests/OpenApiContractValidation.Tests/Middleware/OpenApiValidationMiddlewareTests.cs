@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -400,10 +401,11 @@ public class OpenApiValidationMiddlewareTests
     }
 
     [Fact]
-    public async Task MalformedJsonResponseBody_InvalidJsonPassedThroughAsNullBody()
+    public async Task MalformedJsonResponseBody_Throws_AndClientDoesNotGetBadBody()
     {
-        // TryParseJson catch on the response side yields Body=null; ResponseValidator treats a null body
-        // as "no schema instance to evaluate" and returns success, so the bad bytes reach the client.
+        // The operation declares a 200 application/json body; "{bad" cannot be parsed as JSON, so the
+        // response is a contract violation. Under the Throw policy the offending bytes must never
+        // reach the client.
         var outcome = await InvokeAsync(
             request: () => new HttpRequestMessage(HttpMethod.Get, "/users/1"),
             terminal: async ctx =>
@@ -415,11 +417,113 @@ public class OpenApiValidationMiddlewareTests
             direction: ValidationDirection.Both
         );
 
+        var ex = AssertPhase(outcome, ContractPhase.Response);
+
+        // If the host rendered a 500 (rather than rethrowing), ensure it did not echo the bad body.
+        if (outcome.Response is not null)
+        {
+            var body = await outcome.Response.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("{bad", body);
+        }
+
+        Assert.NotNull(ex);
+        Assert.Contains(ex.Violations, v => v.Location == "responseBody");
+        Assert.Contains(ex.Violations, v => v.Message.Contains("not valid JSON"));
+    }
+
+    [Fact]
+    public async Task MalformedJsonRequestBody_UnderDeclaredJsonBody_Throws()
+    {
+        // POST /users declares a required application/json request body; "{bad" is not valid JSON,
+        // so the request is a contract violation before the handler runs.
+        var outcome = await InvokeAsync(
+            request: () =>
+            {
+                var message = new HttpRequestMessage(HttpMethod.Post, "/users")
+                {
+                    Content = new StringContent("{bad", Encoding.UTF8, "application/json"),
+                };
+                return message;
+            },
+            terminal: _ => Task.CompletedTask,
+            direction: ValidationDirection.Both
+        );
+
+        var ex = AssertPhase(outcome, ContractPhase.Request);
+
+        Assert.NotNull(ex);
+        Assert.Contains(ex.Violations, v => v.Location == "requestBody");
+        Assert.Contains(ex.Violations, v => v.Message.Contains("not valid JSON"));
+    }
+
+    /// <summary>
+    /// <c>POST /upload</c> declaring <c>application/octet-stream</c> for both the request and the
+    /// response body. Pins the non-JSON carve-out: garbage bytes under a declared non-JSON media
+    /// type are not JSON-parse failures and must keep passing through unvalidated.
+    /// </summary>
+    private const string BinaryContractJson = """
+        {
+          "openapi": "3.1.0",
+          "info": { "title": "binary-tests", "version": "1.0.0" },
+          "paths": {
+            "/upload": {
+              "post": {
+                "operationId": "upload",
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/octet-stream": {
+                      "schema": { "type": "string", "format": "binary" }
+                    }
+                  }
+                },
+                "responses": {
+                  "200": {
+                    "description": "ok",
+                    "content": {
+                      "application/octet-stream": {
+                        "schema": { "type": "string", "format": "binary" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    [Fact]
+    public async Task MalformedJsonBodies_NonJsonContentType_StillPass()
+    {
+        var outcome = await InvokeAsync(
+            request: () =>
+            {
+                var message = new HttpRequestMessage(HttpMethod.Post, "/upload")
+                {
+                    Content = new StringContent(
+                        "\u0000\u0001binary-garbage\u00ff",
+                        Encoding.UTF8,
+                        "application/octet-stream"
+                    ),
+                };
+                return message;
+            },
+            terminal: async ctx =>
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "application/octet-stream";
+                await ctx.Response.WriteAsync("\u0000\u0001binary-garbage\u00ff");
+            },
+            direction: ValidationDirection.Both,
+            contract: BinaryContractJson
+        );
+
         Assert.True(outcome.Exception is null, outcome.Exception?.Message ?? string.Empty);
         Assert.NotNull(outcome.Response);
         Assert.Equal(HttpStatusCode.OK, outcome.Response!.StatusCode);
         var body = await outcome.Response.Content.ReadAsStringAsync();
-        Assert.Equal("{bad", body);
+        Assert.Contains("binary-garbage", body);
     }
 
     [Fact]
@@ -610,6 +714,34 @@ public class OpenApiValidationMiddlewareTests
     }
 
     [Fact]
+    public async Task LogPolicy_MalformedJsonResponse_DoesNotThrow_AndDeliversInvalidBody()
+    {
+        OpenApiContractValidationException? observed = null;
+
+        var outcome = await InvokeWithOptions(
+            request: () => new HttpRequestMessage(HttpMethod.Get, "/users/1"),
+            terminal: ctx =>
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "application/json";
+                return ctx.Response.WriteAsync("{bad");
+            },
+            configure: o =>
+            {
+                o.Handling = ViolationHandling.Log;
+                o.OnViolation = ex => observed = ex;
+            }
+        );
+
+        Assert.Null(outcome.Exception);
+        Assert.Equal(HttpStatusCode.OK, outcome.Response!.StatusCode);
+        Assert.Equal("{bad", await outcome.Response.Content.ReadAsStringAsync());
+        Assert.NotNull(observed);
+        Assert.Equal(ContractPhase.Response, observed!.Phase);
+        Assert.Contains(observed.Violations, v => v.Message.Contains("not valid JSON"));
+    }
+
+    [Fact]
     public async Task OnViolation_Callback_IsInvoked_WithViolationDetails()
     {
         OpenApiContractValidationException? observed = null;
@@ -660,6 +792,39 @@ public class OpenApiValidationMiddlewareTests
     }
 
     [Fact]
+    public async Task ThrowingOnViolationObserver_DoesNotBreakViolationHandling()
+    {
+        // An observer that itself throws must never replace the contract violation exception
+        // (Throw policy) or break the request: the OpenApiContractValidationException is still
+        // the one that surfaces, not the observer's exception.
+        OpenApiContractValidationException? observed = null;
+
+        var outcome = await InvokeWithOptions(
+            request: () => new HttpRequestMessage(HttpMethod.Get, "/not/in/spec"),
+            terminal: ctx =>
+            {
+                ctx.Response.StatusCode = 200;
+                return Task.CompletedTask;
+            },
+            configure: o =>
+            {
+                o.Handling = ViolationHandling.Throw;
+                o.OnViolation = ex =>
+                {
+                    observed = ex;
+                    throw new InvalidOperationException("observer blew up");
+                };
+            }
+        );
+
+        Assert.NotNull(outcome.Exception);
+        Assert.IsNotType<InvalidOperationException>(outcome.Exception);
+        Assert.NotNull(observed);
+        Assert.Same(outcome.Exception, observed);
+        Assert.Equal(ContractPhase.Request, outcome.Exception!.Phase);
+    }
+
+    [Fact]
     public async Task StreamingOperation_IsSkipped_AndPassesThroughUnvalidated()
     {
         const string streamingContract = """
@@ -698,6 +863,116 @@ public class OpenApiValidationMiddlewareTests
         Assert.Null(outcome.Exception);
         Assert.Equal(HttpStatusCode.OK, outcome.Response!.StatusCode);
         Assert.Contains("data: hello", await outcome.Response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task RequestBody_OverBufferCap_Throw_ThrowsCatchableViolation()
+    {
+        // Schema-valid JSON, but far beyond the 16-byte cap: the only possible violation is the cap.
+        const string body = """{"name":"a-considerably-longer-value"}""";
+
+        var outcome = await InvokeWithOptions(
+            request: () =>
+                new HttpRequestMessage(HttpMethod.Post, "/users")
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "application/json"),
+                },
+            terminal: async ctx =>
+            {
+                // Conformant response so, without the cap, this request would pass entirely.
+                ctx.Response.StatusCode = 201;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync("""{"id":2,"name":"y"}""");
+            },
+            configure: o => o.MaxRequestBufferSizeBytes = 16
+        );
+
+        var ex = AssertPhase(outcome, ContractPhase.Request);
+
+        Assert.NotNull(ex);
+        var violation = Assert.Single(ex.Violations);
+        Assert.Equal("requestBody", violation.Location);
+        Assert.Contains("maximum buffer size", violation.Message);
+        Assert.Equal("16 bytes", violation.Expected);
+        Assert.Equal($"{Encoding.UTF8.GetByteCount(body)} bytes", violation.Actual);
+    }
+
+    [Fact]
+    public async Task RequestBody_OverBufferCap_Log_SkipsBodyValidationAndContinues()
+    {
+        OpenApiContractValidationException? observed = null;
+        var handlerRan = false;
+        string? downstreamBody = null;
+
+        var outcome = await InvokeWithOptions(
+            request: () =>
+                new HttpRequestMessage(HttpMethod.Post, "/users")
+                {
+                    // Both schema-violating (required "name" missing) and over the 16-byte cap.
+                    Content = new StringContent(
+                        """{"id":123,"unexpected":"xxxxxxxxxxxxxxxx"}""",
+                        Encoding.UTF8,
+                        "application/json"
+                    ),
+                },
+            terminal: async ctx =>
+            {
+                handlerRan = true;
+                // Downstream must still be able to read the (rewound) request body.
+                downstreamBody = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+                ctx.Response.StatusCode = 201;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync("""{"id":2,"name":"y"}""");
+            },
+            configure: o =>
+            {
+                o.MaxRequestBufferSizeBytes = 16;
+                o.Handling = ViolationHandling.Log;
+                o.OnViolation = ex => observed = ex;
+            }
+        );
+
+        Assert.Null(outcome.Exception);
+        Assert.True(handlerRan, "log policy must let the request reach the handler");
+        Assert.Equal(HttpStatusCode.Created, outcome.Response!.StatusCode);
+
+        // Only the cap violation is reported: the body was never parsed, so the schema
+        // violation (missing required "name") must NOT be among the observed violations.
+        Assert.NotNull(observed);
+        Assert.Equal(ContractPhase.Request, observed!.Phase);
+        var violation = Assert.Single(observed.Violations);
+        Assert.Equal("requestBody", violation.Location);
+        Assert.Contains("maximum buffer size", violation.Message);
+
+        // The body stream is still usable downstream: the buffered content survives the cap.
+        Assert.NotNull(downstreamBody);
+        Assert.Contains("unexpected", downstreamBody);
+    }
+
+    [Fact]
+    public async Task RequestBody_UnderBufferCap_ValidatedNormally()
+    {
+        var outcome = await InvokeWithOptions(
+            request: () =>
+                new HttpRequestMessage(HttpMethod.Post, "/users")
+                {
+                    Content = new StringContent(
+                        """{"name":"y"}""",
+                        Encoding.UTF8,
+                        "application/json"
+                    ),
+                },
+            terminal: async ctx =>
+            {
+                ctx.Response.StatusCode = 201;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync("""{"id":2,"name":"y"}""");
+            },
+            configure: o => o.MaxRequestBufferSizeBytes = 64
+        );
+
+        Assert.True(outcome.Exception is null, outcome.Exception?.Message ?? string.Empty);
+        Assert.Equal(HttpStatusCode.Created, outcome.Response!.StatusCode);
     }
 
     /// <summary>
