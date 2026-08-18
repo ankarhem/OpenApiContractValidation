@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   checks: write
@@ -24,11 +28,35 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Restore .NET tools
+        run: dotnet tool restore
+
       - name: Restore
         run: dotnet restore
 
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
+      - name: Format check
+        run: dotnet csharpier check .
+
+      - name: Audit vulnerable packages
+        run: dotnet list package --vulnerable --include-transitive
+
+      - name: Audit deprecated packages (informational)
+        run: dotnet list package --deprecated
+        continue-on-error: true
+
       - name: Test
-        run: dotnet test --configuration Release --no-build --logger "console;verbosity=normal"
+        run: dotnet test --configuration Release --no-build --logger "console;verbosity=normal" --collect:"XPlat Code Coverage"
+
+      - name: Generate coverage report
+        if: success()
+        run: dotnet reportgenerator -reports:'**/coverage.cobertura.xml' -targetdir:coveragereport -reporttypes:MarkdownSummaryGithub
+
+      - name: Upload coverage report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coveragereport
