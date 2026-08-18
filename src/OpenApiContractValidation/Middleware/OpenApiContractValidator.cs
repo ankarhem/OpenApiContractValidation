@@ -41,6 +41,7 @@ public sealed class OpenApiContractValidator
     private readonly ResponseValidator _responseValidator;
     private readonly PathTemplateMatcher _pathMatcher;
     private readonly HashSet<OpenApiOperation> _streamingOperations;
+    private readonly Dictionary<OpenApiOperation, string> _operationKeys;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OpenApiContractValidator"/> class, loading and
@@ -77,10 +78,15 @@ public sealed class OpenApiContractValidator
         _requestValidator = new RequestValidator(_schemaRegistry);
         _responseValidator = new ResponseValidator(_schemaRegistry);
         _pathMatcher = new PathTemplateMatcher(_document.Paths.Keys);
+        _operationKeys = BuildOperationKeys(_document);
     }
 
     /// <summary>The bound options that configured this validator.</summary>
     public OpenApiValidationOptions Options => _options;
+
+    // The compiled schema registry backing the validators. Exposed for tests asserting the
+    // target-schema cache stays bounded across distinct concrete paths.
+    internal ContractSchemaRegistry SchemaRegistry => _schemaRegistry;
 
     /// <summary>
     /// Indicates whether the given operation declares a streaming media type
@@ -172,14 +178,51 @@ public sealed class OpenApiContractValidator
         OpenApiOperation operation,
         ParsedRequest request,
         IReadOnlyDictionary<string, string> pathParameters
-    ) => _requestValidator.Validate(operation, request, pathParameters);
+    ) => _requestValidator.Validate(operation, request, pathParameters, GetOperationKey(operation));
 
     /// <summary>
     /// Validates <paramref name="response"/> against <paramref name="operation"/> using the cached
     /// <see cref="ResponseValidator"/>.
     /// </summary>
     public ValidationResult ValidateResponse(OpenApiOperation operation, ParsedResponse response) =>
-        _responseValidator.Validate(operation, response);
+        _responseValidator.Validate(operation, response, GetOperationKey(operation));
+
+    // Stable per-operation cache-key identity ("{method} {pathTemplate}") resolved by reference.
+    // Operations always originate from TryResolveOperation (i.e. this document), so the lookup
+    // hits; the fallback only guards a caller passing a foreign operation instance.
+    private string GetOperationKey(OpenApiOperation operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        return _operationKeys.TryGetValue(operation, out var key)
+            ? key
+            : operation.OperationId ?? "op";
+    }
+
+    private static Dictionary<OpenApiOperation, string> BuildOperationKeys(OpenApiDocument document)
+    {
+        var keys = new Dictionary<OpenApiOperation, string>(ReferenceEqualityComparer.Instance);
+
+        foreach (var pathPair in document.Paths)
+        {
+            var operations = pathPair.Value?.Operations;
+            if (operations is null)
+            {
+                continue;
+            }
+
+            foreach (var operationPair in operations)
+            {
+                if (operationPair.Value is null)
+                {
+                    continue;
+                }
+
+                keys[operationPair.Value] = $"{operationPair.Key.Method} {pathPair.Key}";
+            }
+        }
+
+        return keys;
+    }
 
     private static OpenApiDocument LoadDocument(OpenApiValidationOptions options)
     {

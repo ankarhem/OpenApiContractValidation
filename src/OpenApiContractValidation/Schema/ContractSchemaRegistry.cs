@@ -1,7 +1,4 @@
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Json.Schema;
@@ -55,6 +52,15 @@ public sealed class ContractSchemaRegistry
 
     private static readonly Uri BaseUri = new(BaseUriString);
 
+    // Shared across all Validate calls: JsonSchema.Net's evaluation only reads these options
+    // (the library itself reuses the static EvaluationOptions.Default for every parameterless
+    // Evaluate, including concurrent ones), so a single instance is safe to reuse.
+    private static readonly EvaluationOptions SharedEvaluationOptions = new()
+    {
+        OutputFormat = OutputFormat.Hierarchical,
+        RequireFormatValidation = true,
+    };
+
     private readonly SchemaRegistry _registry;
     private readonly BuildOptions _buildOptions;
     private readonly ConcurrentDictionary<string, JsonSchema> _targetCache = new();
@@ -92,6 +98,10 @@ public sealed class ContractSchemaRegistry
     /// document's <c>$defs</c>.
     /// </summary>
     public JsonSchema RootSchema { get; }
+
+    // Number of compiled target schemas currently cached. Exposed for tests asserting that
+    // a stable per-operation cache key keeps the cache bounded regardless of concrete path.
+    internal int CachedSchemaCount => _targetCache.Count;
 
     /// <summary>
     /// Returns a compiled <see cref="JsonSchema"/> for validating instances against the
@@ -143,13 +153,7 @@ public sealed class ContractSchemaRegistry
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(locationLabel);
 
-        var options = new EvaluationOptions
-        {
-            OutputFormat = OutputFormat.Hierarchical,
-            RequireFormatValidation = true,
-        };
-
-        var results = schema.Evaluate(instance, options);
+        var results = schema.Evaluate(instance, SharedEvaluationOptions);
         if (results.IsValid)
         {
             return ValidationResult.Success;
