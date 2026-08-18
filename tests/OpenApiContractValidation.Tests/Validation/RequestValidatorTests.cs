@@ -640,6 +640,23 @@ public class RequestValidatorTests
         Assert.False(result.IsValid);
     }
 
+    [Fact]
+    public void ContentParameter_MalformedJson_ProducesViolationNotException()
+    {
+        var (operation, validator) = ParseOperation(ContentParamJson, "/content", HttpMethod.Get);
+        var request = MakeGetRequest("/content", query: Multi(("data", "{bad")));
+
+        var result = validator.Validate(operation, request, _noPathParameters);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(
+            result.Violations,
+            v =>
+                v.Location == "query/data"
+                && v.Message.Contains("not valid JSON", StringComparison.OrdinalIgnoreCase)
+        );
+    }
+
     private const string OptionalBodyJson = """
         {
           "openapi": "3.1.0",

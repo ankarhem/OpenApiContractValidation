@@ -1,6 +1,4 @@
-using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.OpenApi;
@@ -19,7 +17,7 @@ namespace OpenApiContractValidation.Validation;
 /// <remarks>
 /// <para>
 /// The validator is constructed once with a <see cref="ContractSchemaRegistry"/> and may be
-/// invoked concurrently for any number of operations. Each <see cref="Validate"/> call:
+/// invoked concurrently for any number of operations. Each <see cref="Validate(Microsoft.OpenApi.OpenApiOperation, OpenApiContractValidation.Models.ParsedResponse)"/> call:
 /// <list type="number">
 /// <item><description>Matches the status code against the operation's <c>responses</c> keys
 /// (exact &gt; range class &gt; <c>default</c>) via <see cref="StatusMatcher"/>.</description></item>
@@ -71,14 +69,32 @@ public sealed class ResponseValidator
     public ValidationResult Validate(OpenApiOperation operation, ParsedResponse response)
     {
         ArgumentNullException.ThrowIfNull(operation);
+        return Validate(
+            operation,
+            response,
+            operation.OperationId is null ? "op" : operation.OperationId
+        );
+    }
+
+    // Overload taking an explicit, stable per-operation cache key. The caller (the middleware
+    // layer) supplies a startup-computed "{method} {pathTemplate}" identity so schema-cache
+    // entries never collide across operationId-less operations that share status + media type.
+    internal ValidationResult Validate(
+        OpenApiOperation operation,
+        ParsedResponse response,
+        string operationKey
+    )
+    {
+        ArgumentNullException.ThrowIfNull(operation);
         ArgumentNullException.ThrowIfNull(response);
+        ArgumentNullException.ThrowIfNull(operationKey);
 
         var violations = new List<ContractViolation>();
 
         var responseKeys =
             (operation.Responses?.Keys as IReadOnlyCollection<string>)
             ?? operation.Responses?.Keys.ToList()
-            ?? (IReadOnlyCollection<string>)System.Array.Empty<string>();
+            ?? (IReadOnlyCollection<string>)Array.Empty<string>();
 
         // 1. Status code matching.
         if (!StatusMatcher.TryMatch(response.StatusCode, responseKeys, out var matchedStatusKey))
@@ -101,7 +117,6 @@ public sealed class ResponseValidator
 
         var statusKey = matchedStatusKey!;
         var resp = operation.Responses![statusKey];
-        var cachePrefix = operation.OperationId is null ? "op" : operation.OperationId;
 
         // 2. No-body status semantics: 204 and 304 must not carry a body.
         var isNoBodyStatus = response.StatusCode == 204 || response.StatusCode == 304;
@@ -120,13 +135,13 @@ public sealed class ResponseValidator
         }
 
         // 3. Response headers: validate only the headers the contract declares.
-        ValidateHeaders(resp, response, cachePrefix, violations);
+        ValidateHeaders(resp, response, operationKey, violations);
 
         // 4. Response body. Gate on HasBody (not parsed Body) so the content-type check
         // also runs for non-JSON bodies.
         if (!isNoBodyStatus && response.HasBody)
         {
-            ValidateBody(resp, response, cachePrefix, statusKey, violations);
+            ValidateBody(resp, response, operationKey, statusKey, violations);
         }
 
         return violations.Count == 0
@@ -159,7 +174,7 @@ public sealed class ResponseValidator
                 continue;
             }
 
-            var actualValues = FindHeader(response.Headers, name);
+            var actualValues = OpenApiSchemaResolution.FindHeader(response.Headers, name);
 
             if (actualValues is null || actualValues.Count == 0)
             {
@@ -255,6 +270,31 @@ public sealed class ResponseValidator
             return;
         }
 
+        // A matched JSON media type with a non-empty raw body but no parsed instance means the
+        // body is malformed JSON: contract drift, not "no instance to evaluate". The actual
+        // content type must be JSON-ish too: the matcher is lenient on a missing content type
+        // (it can match a JSON key without one), but no parse was attempted then, so a null
+        // Body is not a parse failure.
+        if (
+            response.Body is null
+            && IsJsonMediaType(matchedMediaType!)
+            && IsJsonMediaType(response.ContentType)
+            && !string.IsNullOrEmpty(response.RawBody)
+        )
+        {
+            violations.Add(
+                new ContractViolation(
+                    Location: "responseBody",
+                    InstanceLocation: null,
+                    Keyword: null,
+                    Expected: null,
+                    Actual: null,
+                    Message: "response body is not valid JSON"
+                )
+            );
+            return;
+        }
+
         var mediaType = content[matchedMediaType!];
         var schema = mediaType.Schema;
         if (schema is null)
@@ -295,24 +335,14 @@ public sealed class ResponseValidator
     }
 
     /// <summary>
-    /// Case-insensitively locates <paramref name="name"/> among the actual response headers.
-    /// HTTP header names are case-insensitive per RFC 9110, so the lookup must be too.
+    /// Determines whether a media-type string denotes JSON (loose case-insensitive "json"
+    /// substring, mirroring the middleware's content-type check), covering the actual
+    /// <c>Content-Type</c> header as well as contract keys such as <c>application/json</c>,
+    /// <c>text/json</c> and structured suffixes like <c>application/*+json</c>. Returns
+    /// <see langword="false"/> when the value is null (e.g. a missing content type).
     /// </summary>
-    private static IReadOnlyList<string>? FindHeader(
-        IReadOnlyDictionary<string, IReadOnlyList<string>> actual,
-        string name
-    )
-    {
-        foreach (var (key, values) in actual)
-        {
-            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return values;
-            }
-        }
-
-        return null;
-    }
+    private static bool IsJsonMediaType(string? mediaType) =>
+        mediaType is not null && mediaType.Contains("json", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Converts a raw header string value into a JSON node whose primitive shape matches the
@@ -329,7 +359,7 @@ public sealed class ResponseValidator
             return null;
         }
 
-        var resolved = ResolveSchema(schema);
+        var resolved = OpenApiSchemaResolution.Resolve(schema);
         var type = resolved?.Type ?? (JsonSchemaType)0;
 
         if ((type & JsonSchemaType.Array) != 0)
@@ -350,7 +380,7 @@ public sealed class ResponseValidator
 
         if (
             (type & JsonSchemaType.Integer) != 0
-            && int.TryParse(first, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)
+            && long.TryParse(first, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)
         )
         {
             return (JsonNode)i;
@@ -370,27 +400,5 @@ public sealed class ResponseValidator
         }
 
         return (JsonNode)first;
-    }
-
-    /// <summary>
-    /// Unwraps an <see cref="OpenApiSchemaReference"/> to its resolved target, so header-value
-    /// coercion can read the declared <c>type</c>. Bounded to guarantee termination on
-    /// pathological reference chains (mirrors <c>ReadOnlyWriteOnlyChecker.Resolve</c>).
-    /// </summary>
-    private static IOpenApiSchema? ResolveSchema(IOpenApiSchema? schema)
-    {
-        var guard = 0;
-        while (schema is OpenApiSchemaReference reference)
-        {
-            var target = reference.RecursiveTarget;
-            if (target is null || ReferenceEquals(target, schema) || ++guard > 64)
-            {
-                break;
-            }
-
-            schema = target;
-        }
-
-        return schema;
     }
 }

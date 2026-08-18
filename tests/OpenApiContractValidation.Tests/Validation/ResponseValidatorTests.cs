@@ -326,6 +326,35 @@ public class ResponseValidatorTests
     }
 
     [Fact]
+    public void ResponseHeader_DeclaredInteger_ValueAboveIntMax_Passes()
+    {
+        var (_, validator) = Create();
+        var op = OperationWithResponse(
+            "h-large-int",
+            new OpenApiResponse
+            {
+                Headers = new Dictionary<string, IOpenApiHeader>
+                {
+                    ["X-Large-Id"] = new OpenApiHeader
+                    {
+                        Required = true,
+                        Schema = new OpenApiSchema { Type = JsonSchemaType.Integer },
+                    },
+                },
+            }
+        );
+        var response = Build(200, headers: Headers(("X-Large-Id", "3000000000")));
+
+        var result = validator.Validate(op, response);
+
+        Assert.True(
+            result.IsValid,
+            "integer response header above int.MaxValue should coerce to long and pass"
+        );
+        Assert.Empty(result.Violations);
+    }
+
+    [Fact]
     public void ArrayHeaderValue_SplitsOnComma_AndValidates()
     {
         var (_, validator) = Create();

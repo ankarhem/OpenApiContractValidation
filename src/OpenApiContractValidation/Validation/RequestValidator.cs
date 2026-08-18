@@ -19,7 +19,7 @@ namespace OpenApiContractValidation.Validation;
 /// <remarks>
 /// <para>
 /// The validator is constructed once with a <see cref="ContractSchemaRegistry"/> and may be
-/// invoked concurrently for any number of operations. A single <see cref="Validate"/> call
+/// invoked concurrently for any number of operations. A single <see cref="Validate(Microsoft.OpenApi.OpenApiOperation, OpenApiContractValidation.Models.ParsedRequest, System.Collections.Generic.IReadOnlyDictionary{string, string})"/> call
 /// orchestrates the already-built deserialization, schema-evaluation and content-type
 /// matching components to check, maximally strictly:
 /// <list type="bullet">
@@ -93,13 +93,28 @@ public sealed class RequestValidator
     {
         ArgumentNullException.ThrowIfNull(operation);
         ArgumentNullException.ThrowIfNull(request);
+        return Validate(operation, request, pathParameters, operation.OperationId ?? request.Path);
+    }
+
+    // Overload taking an explicit, stable per-operation cache key. The caller (the middleware
+    // layer) supplies a startup-computed "{method} {pathTemplate}" identity so schema-cache
+    // entries never collide across operationId-less operations, nor grow per concrete path.
+    internal ValidationResult Validate(
+        OpenApiOperation operation,
+        ParsedRequest request,
+        IReadOnlyDictionary<string, string> pathParameters,
+        string operationKey
+    )
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(pathParameters);
+        ArgumentNullException.ThrowIfNull(operationKey);
 
         var violations = new List<ContractViolation>();
-        var cachePrefix = operation.OperationId ?? request.Path;
 
-        ValidateParameters(operation, request, pathParameters, cachePrefix, violations);
-        ValidateBody(operation, request, cachePrefix, violations);
+        ValidateParameters(operation, request, pathParameters, operationKey, violations);
+        ValidateBody(operation, request, operationKey, violations);
 
         return violations.Count == 0
             ? ValidationResult.Success
@@ -287,7 +302,7 @@ public sealed class RequestValidator
     {
         var name = parameter.Name ?? "?";
         var location = $"header/{name}";
-        var rawValues = FindHeader(request.Headers, name);
+        var rawValues = OpenApiSchemaResolution.FindHeader(request.Headers, name);
 
         if (rawValues is null || rawValues.Count == 0)
         {
@@ -366,7 +381,24 @@ public sealed class RequestValidator
         {
             // Content-based parameter: parse the single raw value as its declared media type.
             var first = rawValues.Count > 0 ? rawValues[0] : string.Empty;
-            node = ParameterDeserializer.DeserializeContent(parameter, first);
+            try
+            {
+                node = ParameterDeserializer.DeserializeContent(parameter, first);
+            }
+            catch (JsonException)
+            {
+                violations.Add(
+                    new ContractViolation(
+                        Location: location,
+                        InstanceLocation: null,
+                        Keyword: null,
+                        Expected: null,
+                        Actual: first,
+                        Message: "parameter value is not valid JSON"
+                    )
+                );
+                return;
+            }
         }
         else
         {
@@ -492,6 +524,31 @@ public sealed class RequestValidator
             return;
         }
 
+        // A matched JSON media type with a non-empty raw body but no parsed instance means the
+        // body is malformed JSON: contract drift, not "no instance to evaluate". The actual
+        // content type must be JSON-ish too: the matcher is lenient on a missing content type
+        // (it can match a JSON key without one), but no parse was attempted then, so a null
+        // Body is not a parse failure.
+        if (
+            request.Body is null
+            && IsJsonMediaType(matchedMediaType!)
+            && IsJsonMediaType(request.ContentType)
+            && !string.IsNullOrEmpty(request.RawBody)
+        )
+        {
+            violations.Add(
+                new ContractViolation(
+                    Location: "requestBody",
+                    InstanceLocation: null,
+                    Keyword: null,
+                    Expected: null,
+                    Actual: null,
+                    Message: "request body is not valid JSON"
+                )
+            );
+            return;
+        }
+
         var mediaType = content[matchedMediaType!];
         var schema = mediaType.Schema;
         if (schema is null)
@@ -499,9 +556,8 @@ public sealed class RequestValidator
             return;
         }
 
-        // Schema validation needs a parsed JSON body; a non-JSON body (e.g.
-        // application/octet-stream) passes the content-type check above but has no JSON
-        // instance to evaluate.
+        // A non-JSON body (e.g. application/octet-stream) passes the content-type check above
+        // but has no JSON instance to evaluate.
         if (request.Body is null)
         {
             return;
@@ -544,24 +600,14 @@ public sealed class RequestValidator
         );
 
     /// <summary>
-    /// Case-insensitively locates <paramref name="name"/> among the actual request headers.
-    /// HTTP header names are case-insensitive per RFC 9110, so the lookup must be too.
+    /// Determines whether a media-type string denotes JSON (loose case-insensitive "json"
+    /// substring, mirroring the middleware's content-type check), covering the actual
+    /// <c>Content-Type</c> header as well as contract keys such as <c>application/json</c>,
+    /// <c>text/json</c> and structured suffixes like <c>application/*+json</c>. Returns
+    /// <see langword="false"/> when the value is null (e.g. a missing content type).
     /// </summary>
-    private static IReadOnlyList<string>? FindHeader(
-        IReadOnlyDictionary<string, IReadOnlyList<string>> actual,
-        string name
-    )
-    {
-        foreach (var (key, values) in actual)
-        {
-            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return values;
-            }
-        }
-
-        return null;
-    }
+    private static bool IsJsonMediaType(string? mediaType) =>
+        mediaType is not null && mediaType.Contains("json", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsObjectSchema(IOpenApiSchema? schema) =>
         schema is not null
@@ -583,7 +629,7 @@ public sealed class RequestValidator
             return null;
         }
 
-        var resolved = ResolveSchema(schema);
+        var resolved = OpenApiSchemaResolution.Resolve(schema);
         var type = resolved?.Type ?? (JsonSchemaType)0;
 
         switch (node)
@@ -655,27 +701,5 @@ public sealed class RequestValidator
         }
 
         return node;
-    }
-
-    /// <summary>
-    /// Unwraps an <see cref="OpenApiSchemaReference"/> to its resolved target so coercion can
-    /// read the declared <c>type</c>. Bounded to guarantee termination on pathological
-    /// reference chains (mirrors <c>ReadOnlyWriteOnlyChecker.Resolve</c>).
-    /// </summary>
-    private static IOpenApiSchema? ResolveSchema(IOpenApiSchema? schema)
-    {
-        var guard = 0;
-        while (schema is OpenApiSchemaReference reference)
-        {
-            var target = reference.RecursiveTarget;
-            if (target is null || ReferenceEquals(target, schema) || ++guard > 64)
-            {
-                break;
-            }
-
-            schema = target;
-        }
-
-        return schema;
     }
 }
