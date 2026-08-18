@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>OpenApiContractValidation</PackageId>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Authors>ankarhem</Authors>
     <Copyright>Copyright (c) 2026 ankarhem</Copyright>
     <Description>ASP.NET Core middleware that validates HTTP requests and responses fully conform to an OpenAPI contract, throwing on any violation.</Description>
@@ -12,7 +12,7 @@
     <RepositoryUrl>https://github.com/ankarhem/OpenApiContractValidation</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
-    <PackageReleaseNotes>Switched license from MIT to MPL-2.0 (weak copyleft: closed-source apps and SaaS may use freely; modifications to this library's source files must be released under MPL-2.0).</PackageReleaseNotes>
+    <PackageReleaseNotes>Fixed wrong-schema and unbounded-cache bugs for specs without operationId; malformed JSON bodies and content-based parameters are now violations instead of passing silently or crashing; added MaxRequestBufferSizeBytes with a bounded, cancellation-aware request read; options validated fail-fast at host start; OnViolation observer exceptions are isolated; wrapped contract-file IO errors; 64-bit integer response headers no longer false-violate; CI gains vulnerability audit, coverage reporting, and format checks.</PackageReleaseNotes>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IncludeSymbols>true</IncludeSymbols>
