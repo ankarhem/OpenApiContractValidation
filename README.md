@@ -177,6 +177,7 @@ builder.Services.AddOpenApiValidation(options =>
 | `Handling` | `Throw` | `Throw` (fail on violation) or `Log` (log and continue). |
 | `OnViolation` | `null` | Optional `Action<OpenApiContractValidationException>` observer, invoked for every violation regardless of `Handling`. |
 | `MaxResponseBufferSizeBytes` | `10 MiB` | Cap on the buffered response body. Under `Throw` an over-cap response raises a (catchable) `OpenApiContractValidationException` and is suppressed; under `Log` it streams through unvalidated. |
+| `MaxRequestBufferSizeBytes` | `10 MiB` | Cap on the request body read for validation. Under `Throw` an over-cap body raises a (catchable) `OpenApiContractValidationException` and the body is not validated; under `Log` the violation is logged, body validation is skipped, and the request proceeds (the stream is rewound so downstream handlers can still read it). |
 
 Exactly one contract source (`ContractFilePath`, `ContractStream`, or `ContractText`) must be set.
 
@@ -184,6 +185,17 @@ Exactly one contract source (`ContractFilePath`, `ContractStream`, or `ContractT
 
 - **Throws by default**, or logs and continues when `Handling = ViolationHandling.Log`. Either way
   `OnViolation` is invoked for each violation.
+- **`OnViolation` observer exceptions are isolated**: if the callback throws, the exception is logged
+  and violation handling proceeds — the observer can never replace the contract violation exception
+  or break the request.
+- **Malformed JSON bodies are a violation** when the matched contract media type is JSON and the
+  actual `Content-Type` is JSON-ish: a body that is not parseable JSON yields a "body is not valid
+  JSON" violation (request: `requestBody`, response: `responseBody`), thrown before the bad response
+  reaches the client under `Throw`. Non-JSON media types (e.g. `application/octet-stream`) still pass
+  through unvalidated.
+- **Options are validated fail-fast at host start**: non-positive `MaxResponseBufferSizeBytes` /
+  `MaxRequestBufferSizeBytes` or an unknown `ContractFormat` (must be `null` / `"json"` / `"yaml"`)
+  fail host startup with `OptionsValidationException`.
 - **Streaming responses can't be validated** (OpenAPI 3.0/3.1 has no model for per-item streaming
   bodies). Operations that declare `text/event-stream`, and responses that disable buffering at
   runtime, are **skipped** (passed through unvalidated) rather than rejected — the app starts and
