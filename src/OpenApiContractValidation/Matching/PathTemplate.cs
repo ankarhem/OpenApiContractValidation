@@ -76,7 +76,8 @@ public sealed class PathTemplate
     /// <exception cref="ArgumentNullException"><paramref name="template"/> is <see langword="null"/>.</exception>
     public PathTemplate(string template)
     {
-        Template = template ?? throw new ArgumentNullException(nameof(template));
+        ArgumentNullException.ThrowIfNull(template);
+        Template = template;
 
         var segments = template.Split('/');
         var patternParts = new string[segments.Length];
@@ -107,7 +108,7 @@ public sealed class PathTemplate
         SpecificityKey = kinds;
 
         var pattern = "^" + string.Join('/', patternParts) + "$";
-        _compiled = new Regex(pattern, RegexOptions.CultureInvariant);
+        _compiled = new Regex(pattern, RegexOptions.CultureInvariant | RegexOptions.Compiled);
     }
 
     /// <summary>

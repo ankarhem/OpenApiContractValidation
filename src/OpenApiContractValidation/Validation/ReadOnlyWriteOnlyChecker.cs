@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using Microsoft.OpenApi;
 using OpenApiContractValidation.Errors;
+using OpenApiContractValidation.Schema;
 
 namespace OpenApiContractValidation.Validation;
 
@@ -88,7 +89,7 @@ public static class ReadOnlyWriteOnlyChecker
         List<(string, string, string)> violations
     )
     {
-        var resolved = Resolve(schema);
+        var resolved = OpenApiSchemaResolution.Resolve(schema);
         if (resolved is null)
         {
             return;
@@ -192,7 +193,7 @@ public static class ReadOnlyWriteOnlyChecker
         HashSet<IOpenApiSchema> visited
     )
     {
-        var resolved = Resolve(schema);
+        var resolved = OpenApiSchemaResolution.Resolve(schema);
         if (resolved is null || !visited.Add(resolved))
         {
             return false;
@@ -234,25 +235,6 @@ public static class ReadOnlyWriteOnlyChecker
             }
         }
         return false;
-    }
-
-    /// <summary>
-    /// Unwraps an <see cref="OpenApiSchemaReference"/> to its fully-resolved target.
-    /// Bounded to guarantee termination on pathological reference chains.
-    /// </summary>
-    private static IOpenApiSchema? Resolve(IOpenApiSchema? schema)
-    {
-        var guard = 0;
-        while (schema is OpenApiSchemaReference reference)
-        {
-            var target = reference.RecursiveTarget;
-            if (target is null || ReferenceEquals(target, schema) || ++guard > 64)
-            {
-                break;
-            }
-            schema = target;
-        }
-        return schema;
     }
 
     /// <summary>Escapes a JSON Pointer reference token (RFC 6901: '~' then '/').</summary>
